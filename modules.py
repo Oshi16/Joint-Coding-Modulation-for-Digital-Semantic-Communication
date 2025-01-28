@@ -28,17 +28,17 @@ def awgn(snr, x):
 
 
 class ResidualBlock(tf.keras.layers.Layer):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, inchannel, outchannel, stride=1):
         super(ResidualBlock, self).__init__()
-        self.conv1 = Conv2D(out_channels, kernel_size=3, strides=stride, padding='same', use_bias=False)
+        self.conv1 = Conv2D(outchannel, kernel_size=3, strides=stride, padding='same', use_bias=False)
         self.bn1 = BatchNormalization()
         self.prelu1 = PReLU()
-        self.conv2 = Conv2D(out_channels, kernel_size=3, strides=1, padding='same', use_bias=False)
+        self.conv2 = Conv2D(outchannel, kernel_size=3, strides=1, padding='same', use_bias=False)
         self.bn2 = BatchNormalization()
         self.shortcut = tf.keras.Sequential()
-        if stride != 1 or in_channels != out_channels:
+        if stride != 1 or inchannel != outchannel:
             self.shortcut = tf.keras.Sequential([
-                Conv2D(out_channels, kernel_size=1, strides=stride, use_bias=False),
+                Conv2D(outchannel, kernel_size=1, strides=stride, use_bias=False),
                 BatchNormalization()
             ])
         self.prelu2 = PReLU()
@@ -58,7 +58,7 @@ class Encoder(tf.keras.layers.Layer):
     def __init__(self, config):
         super(Encoder, self).__init__()
         self.config = config
-        self.in_channels = 64
+        self.inchannel = 64
         self.conv1 = tf.keras.Sequential([
             Conv2D(64, kernel_size=3, strides=1, padding='same', use_bias=False),
             BatchNormalization(),
@@ -72,12 +72,12 @@ class Encoder(tf.keras.layers.Layer):
         else:
             self.layer4 = self._make_layer(ResidualBlock, config.channel_use * 2, 2, stride=2)
 
-    def _make_layer(self, block, out_channels, num_blocks, stride):
+    def _make_layer(self, block, outchannel, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_channels, out_channels, stride))
-            self.in_channels = out_channels
+            layers.append(block(self.inchannel, outchannel, stride))
+            self.inchannel = outchannel
         return tf.keras.Sequential(layers)
 
     def call(self, x):
@@ -122,12 +122,12 @@ class Decoder_Recon(tf.keras.layers.Layer):
         self.depth_to_space2 = DepthToSpace(2)
         self.conv3 = Conv2D(3, kernel_size=1, strides=1, padding='valid')
 
-    def _make_layer(self, block, out_channels, num_blocks, stride):
+    def _make_layer(self, block, outchannel, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_channels, out_channels, stride))
-            self.in_channels = out_channels
+            layers.append(block(self.inchannel, outchannel, stride))
+            self.inchannel = outchannel
         return tf.keras.Sequential(layers)
 
     def call(self, z):

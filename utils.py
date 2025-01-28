@@ -1,8 +1,8 @@
-import torch
-import matplotlib.pyplot as plt
-import os
-from mpl_toolkits.mplot3d import Axes3D
+import tensorflow as tf
 import numpy as np
+import os
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 import random
 from skimage.metrics import peak_signal_noise_ratio as comp_psnr
 from skimage.metrics import structural_similarity as comp_ssim
@@ -10,54 +10,46 @@ from skimage.metrics import mean_squared_error as comp_mse
 
 
 def init_seeds(seed=42):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if seed == 42:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    tf.random.set_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
-def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
+def save_checkpoint(state, filename="my_checkpoint"):
     print("=>Saving checkpoint")
-    torch.save(state, filename)
+    tf.saved_model.save(state, filename)
 
 
 def count_percentage(code, mod, epoch, snr, channel_use, tradeoff_h):
     if mod == '4qam' or mod == 'bpsk':
         pass
     else:
-        code = code.reshape(-1)
+        code = tf.reshape(code, [-1, 2]).numpy()
         index = [i for i in range(len(code))]
         random.shuffle(index)
         code = code[index]
-        code = code.reshape(-1, 2).cpu()
 
         if mod == '16qam':
-            I_point = torch.tensor([-3, -1, 1, 3])
+            I_point = np.array([-3, -1, 1, 3])
             order = 16
         elif mod == '64qam':
-            I_point = torch.tensor([-7, -5, -3, -1, 1, 3, 5, 7])
+            I_point = np.array([-7, -5, -3, -1, 1, 3, 5, 7])
             order = 64
 
-        I, Q = torch.meshgrid(I_point, I_point)
-        map = torch.cat((I.unsqueeze(-1), Q.unsqueeze(-1)), dim=2).reshape(order, 2)
+        I, Q = np.meshgrid(I_point, I_point)
+        map = np.stack((I.flatten(), Q.flatten()), axis=-1)
         per_s = []
         fig = plt.figure(dpi=300)
         ax = Axes3D(fig)
-        fig.add_axes(ax)
         for i in range(order):
-            temp = torch.sum(torch.abs(code - map[i, :]), dim=1)
-            num = code.shape[0] - torch.count_nonzero(temp).item()
+            temp = np.sum(np.abs(code - map[i]), axis=1)
+            num = np.count_nonzero(temp == 0)
             per = num / code.shape[0]
             per_s.append(per)
-        per_s = torch.tensor(per_s).cpu()
+        per_s = np.array(per_s)
         height = np.zeros_like(per_s)
         width = depth = 0.3
-        surf = ax.bar3d(I.ravel(), Q.ravel(), height, width, depth, per_s, zsort='average')
-        surf._facecolors2d = surf._facecolor3d
-        surf._edgecolors2d = surf._edgecolor3d
+        ax.bar3d(I.ravel(), Q.ravel(), height, width, depth, per_s, zsort='average')
         file_name = './cons_fig/' + '{}_{}_{}_{}'.format(mod, snr, channel_use, tradeoff_h)
         if not os.path.exists(file_name):
             os.makedirs(file_name)
@@ -75,13 +67,13 @@ def count_percentage(code, mod, epoch, snr, channel_use, tradeoff_h):
 
 def PSNR(tensor_org, tensor_trans):
     total_psnr = 0
-    origin = ((tensor_org + 1) / 2).cpu().numpy()
-    trans = ((tensor_trans + 1) / 2).cpu().numpy()
-    for i in range(np.size(trans, 0)):
+    origin = ((tensor_org + 1) / 2).numpy()
+    trans = ((tensor_trans + 1) / 2).numpy()
+    for i in range(trans.shape[0]):
         psnr = 0
-        for j in range(np.size(trans, 1)):
+        for j in range(trans.shape[1]):
             psnr_temp = comp_psnr(origin[i, j, :, :], trans[i, j, :, :])
-            psnr = psnr + psnr_temp
+            psnr += psnr_temp
         psnr /= 3
         total_psnr += psnr
     return total_psnr
@@ -89,21 +81,20 @@ def PSNR(tensor_org, tensor_trans):
 
 def SSIM(tensor_org, tensor_trans):
     total_ssim = 0
-    origin = tensor_org.cpu().numpy()
-    trans = tensor_trans.cpu().numpy()
-    for i in range(np.size(trans, 0)):
+    origin = tensor_org.numpy()
+    trans = tensor_trans.numpy()
+    for i in range(trans.shape[0]):
         ssim = 0
-        for j in range(np.size(trans, 1)):
+        for j in range(trans.shape[1]):
             ssim_temp = comp_ssim(origin[i, j, :, :], trans[i, j, :, :], data_range=1.0)
-            ssim = ssim + ssim_temp
+            ssim += ssim_temp
         ssim /= 3
         total_ssim += ssim
-
     return total_ssim
 
 
 def MSE(tensor_org, tensor_trans):
-    origin = ((tensor_org + 1) / 2).cpu().numpy()
-    trans = ((tensor_trans + 1) / 2).cpu().numpy()
+    origin = ((tensor_org + 1) / 2).numpy()
+    trans = ((tensor_trans + 1) / 2).numpy()
     mse = np.mean((origin - trans) ** 2)
     return mse * tensor_org.shape[0]

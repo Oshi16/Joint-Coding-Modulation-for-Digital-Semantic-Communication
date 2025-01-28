@@ -1,6 +1,5 @@
 import os
-import torch
-from torch import optim, nn
+import tensorflow as tf
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -9,62 +8,75 @@ from evaluation import EVAL
 from utils import save_checkpoint, PSNR
 
 
-def train(config, net, train_iter, test_iter, device):
+def train(config, net, train_iter, test_iter):
     learning_rate = config.lr
     epochs = config.train_iters
 
-    # lr for prob_conv needs separate setting
-    ignored_params = list(map(id, net.prob_convs.parameters()))
-    base_params = filter(lambda p: id(p) not in ignored_params, net.parameters())
-    optimizer = optim.Adam([
-        {'params': base_params},
-        {'params': net.prob_convs.parameters(), 'lr': learning_rate/2}], learning_rate)
+    # Separate learning rate for specific layers
+    prob_convs_params = [var for var in net.prob_convs.trainable_variables]
+    base_params = [var for var in net.trainable_variables if var not in prob_convs_params]
 
-    loss_f1 = nn.CrossEntropyLoss()
-    loss_f2 = nn.MSELoss()
+    optimizer = tf.keras.optimizers.Adam([
+        {'params': base_params},
+        {'params': prob_convs_params, 'lr': learning_rate / 2}], learning_rate)
+
+    # Loss functions
+    loss_f1 = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    loss_f2 = tf.keras.losses.MeanSquaredError()
     results = {'epoch': [], 'acc': [], 'mse': [], 'psnr': [], 'ssim': [], 'loss': []}
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=config.train_iters+1, T_mult=1, eta_min=1e-6, last_epoch=-1)
+
+    # Learning rate scheduler (CosineAnnealingWarmRestarts equivalent)
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate=learning_rate,
+        first_decay_steps=config.train_iters + 1,
+        t_mul=1.0,
+        m_mul=1.0,
+        alpha=1e-6
+    )
 
     best_acc = 0
     for epoch in range(epochs):
-        net.train()
+        net.trainable = True
         epoch_loss = []
         acc_total_train = 0
         psnr_total_train = 0
-        for i, (X, Y) in enumerate(tqdm(train_iter)):
-            X, Y = X.to(device), Y.to(device)
 
-            optimizer.zero_grad()
-            code, _, _, y_class, y_recon = net(X)
+        for X, Y in tqdm(train_iter):
+            with tf.GradientTape() as tape:
+                code, _, _, y_class, y_recon = net(X, training=True)
 
-            loss_1 = loss_f1(y_class, Y)
-            loss_2 = loss_f2(y_recon, X)
+                loss_1 = loss_f1(Y, y_class)
+                loss_2 = loss_f2(X, y_recon)
 
-            loss = loss_1 + config.tradeoff_lambda * loss_2
+                loss = loss_1 + config.tradeoff_lambda * loss_2
 
-            loss.backward()
-            optimizer.step()
-            epoch_loss.append(loss.cpu().item())
+            # Compute gradients and update weights
+            gradients = tape.gradient(loss, net.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, net.trainable_variables))
 
-            # acc & psnr of the train set
-            acc = (y_class.data.max(1)[1] == Y.data).float().sum()
+            epoch_loss.append(loss.numpy())
+
+            # Accuracy & PSNR of the train set
+            acc = tf.reduce_sum(tf.cast(tf.argmax(y_class, axis=1) == tf.cast(Y, tf.int64), tf.float32))
             acc_total_train += acc
-            psnr = PSNR(X, y_recon.detach())
+            psnr = PSNR(X, y_recon)
             psnr_total_train += psnr
 
-        scheduler.step()
+        # Update learning rate
+        optimizer.learning_rate = lr_schedule(epoch)
 
         loss = sum(epoch_loss) / len(epoch_loss)
         acc_train = acc_total_train / 50000
         psnr_train = psnr_total_train / 50000
 
-        acc, mse, psnr, ssim = EVAL(net, test_iter, device, config, epoch)
-        print('epoch: {:d}, loss: {:.6f}, acc: {:.3f}, mse: {:.6f}, psnr: {:.3f}, ssim: {:.3f}, lr: {:.6f}'.format
-              (epoch, loss, acc, mse, psnr, ssim, optimizer.state_dict()['param_groups'][0]['lr']))
+        # Evaluate the model
+        acc, mse, psnr, ssim = EVAL(net, test_iter, config, epoch)
+        print('epoch: {:d}, loss: {:.6f}, acc: {:.3f}, mse: {:.6f}, psnr: {:.3f}, ssim: {:.3f}, lr: {:.6f}'.format(
+            epoch, loss, acc, mse, psnr, ssim, optimizer.learning_rate))
         print('train acc: {:.3f}'.format(acc_train))
         print('train psnr: {:.3f}'.format(psnr_train))
 
-        acc_num = acc.detach().cpu().numpy()
+        acc_num = acc.numpy()
         results['epoch'].append(epoch)
         results['loss'].append(loss)
         results['acc'].append(acc_num)
@@ -72,23 +84,20 @@ def train(config, net, train_iter, test_iter, device):
         results['psnr'].append(psnr)
         results['ssim'].append(ssim)
 
+        # Save the best model
         if (epochs - epoch) <= 10 and acc_num > best_acc:
-            file_name = config.model_path + '/{}/'.format(config.mod_method)
+            file_name = os.path.join(config.model_path, config.mod_method)
             if not os.path.exists(file_name):
                 os.makedirs(file_name)
-            model_name = 'CIFAR_SNR{:.3f}_Trans{:d}_{}.pth.tar'.format(
-                config.snr_train, config.channel_use, config.mod_method)
-            save_checkpoint(net.state_dict(), file_name + model_name)
+            model_name = f'CIFAR_SNR{config.snr_train:.3f}_Trans{config.channel_use}_{config.mod_method}.h5'
+            save_checkpoint(net, os.path.join(file_name, model_name))
             best_acc = acc_num
 
-    # in the end save all the results
+    # Save all the results
     data = pd.DataFrame(results)
-    file_name = config.result_path + '/{}/'.format(config.mod_method)
+    file_name = os.path.join(config.result_path, config.mod_method)
     if not os.path.exists(file_name):
         os.makedirs(file_name)
 
-    result_name = 'CIFAR_SNR{:.3f}_Trans{:d}_{}.csv'.format(
-            config.snr_train, config.channel_use, config.mod_method)
-    data.to_csv(file_name + result_name, index=False, header=False)
-
-
+    result_name = f'CIFAR_SNR{config.snr_train:.3f}_Trans{config.channel_use}_{config.mod_method}.csv'
+    data.to_csv(os.path.join(file_name, result_name), index=False, header=False)

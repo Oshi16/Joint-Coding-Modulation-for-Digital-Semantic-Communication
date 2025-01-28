@@ -1,88 +1,86 @@
-from torch import nn
-import torch
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, BatchNormalization, PReLU, Dropout, Dense, Reshape
+import numpy as np
 
 
 def normalize(x, power=1):
-    power_emp = torch.mean(x ** 2)
-    x = (power / power_emp) ** 0.5 * x
+    power_emp = tf.reduce_mean(tf.square(x))
+    x = tf.sqrt(power / power_emp) * x
     return power_emp, x
 
 
-class DepthToSpace(torch.nn.Module):
+class DepthToSpace(tf.keras.layers.Layer):
     def __init__(self, block_size):
         super().__init__()
         self.bs = block_size
 
-    def forward(self, x):
-        N, C, H, W = x.size()
-        x = x.view(N, self.bs, self.bs, C // (self.bs ** 2), H, W)
-        x = x.permute(0, 3, 4, 1, 5, 2).contiguous()
-        x = x.view(N, C // (self.bs ** 2), H * self.bs, W * self.bs)
-        return x
+    def call(self, x):
+        return tf.nn.depth_to_space(x, self.bs)
 
 
-def awgn(snr, x, device):
+def awgn(snr, x):
     # snr(db)
     n = 1 / (10 ** (snr / 10))
-    sqrt_n = n ** 0.5
-    noise = torch.randn_like(x) * sqrt_n
-    noise = noise.to(device)
+    sqrt_n = tf.sqrt(n)
+    noise = tf.random.normal(shape=tf.shape(x)) * sqrt_n
     x_hat = x + noise
     return x_hat
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, inchannel, outchannel, stride=1):
+class ResidualBlock(tf.keras.layers.Layer):
+    def __init__(self, in_channels, out_channels, stride=1):
         super(ResidualBlock, self).__init__()
-        self.left = nn.Sequential(
-            nn.Conv2d(inchannel, outchannel, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(outchannel),
-            nn.PReLU(),
-            nn.Conv2d(outchannel, outchannel, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(outchannel)
-        )
-        self.shortcut = nn.Sequential()
-        if stride != 1 or inchannel != outchannel:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(inchannel, outchannel, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(outchannel)
-            )
-        self.prelu = nn.PReLU()
+        self.conv1 = Conv2D(out_channels, kernel_size=3, strides=stride, padding='same', use_bias=False)
+        self.bn1 = BatchNormalization()
+        self.prelu1 = PReLU()
+        self.conv2 = Conv2D(out_channels, kernel_size=3, strides=1, padding='same', use_bias=False)
+        self.bn2 = BatchNormalization()
+        self.shortcut = tf.keras.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = tf.keras.Sequential([
+                Conv2D(out_channels, kernel_size=1, strides=stride, use_bias=False),
+                BatchNormalization()
+            ])
+        self.prelu2 = PReLU()
 
-    def forward(self, x):
-        out = self.left(x)
+    def call(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.prelu1(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
         out += self.shortcut(x)
-        out = self.prelu(out)
+        out = self.prelu2(out)
         return out
 
 
-class Encoder(nn.Module):
+class Encoder(tf.keras.layers.Layer):
     def __init__(self, config):
         super(Encoder, self).__init__()
         self.config = config
-        self.inchannel = 64
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.PReLU(),
-        )
-        self.layer1 = self.make_layer(ResidualBlock, 64, 1, stride=1)
-        self.layer2 = self.make_layer(ResidualBlock, 128, 1, stride=2)
-        self.layer3 = self.make_layer(ResidualBlock, 256, 2, stride=2)
+        self.in_channels = 64
+        self.conv1 = tf.keras.Sequential([
+            Conv2D(64, kernel_size=3, strides=1, padding='same', use_bias=False),
+            BatchNormalization(),
+            PReLU()
+        ])
+        self.layer1 = self._make_layer(ResidualBlock, 64, 1, stride=1)
+        self.layer2 = self._make_layer(ResidualBlock, 128, 1, stride=2)
+        self.layer3 = self._make_layer(ResidualBlock, 256, 2, stride=2)
         if config.mod_method == 'bpsk':
-            self.layer4 = self.make_layer(ResidualBlock, config.channel_use, 2, stride=2)
+            self.layer4 = self._make_layer(ResidualBlock, config.channel_use, 2, stride=2)
         else:
-            self.layer4 = self.make_layer(ResidualBlock, config.channel_use * 2, 2, stride=2)
+            self.layer4 = self._make_layer(ResidualBlock, config.channel_use * 2, 2, stride=2)
 
-    def make_layer(self, block, channels, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)  # strides=[1,1]
+    def _make_layer(self, block, out_channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.inchannel, channels, stride))
-            self.inchannel = channels
-        return nn.Sequential(*layers)
+            layers.append(block(self.in_channels, out_channels, stride))
+            self.in_channels = out_channels
+        return tf.keras.Sequential(layers)
 
-    def forward(self, x):
+    def call(self, x):
         z0 = self.conv1(x)
         z1 = self.layer1(z0)
         z2 = self.layer2(z1)
@@ -91,98 +89,87 @@ class Encoder(nn.Module):
         return z4
 
 
-class Decoder_Recon(nn.Module):
+class Decoder_Recon(tf.keras.layers.Layer):
     def __init__(self, config):
         super(Decoder_Recon, self).__init__()
         self.config = config
-
         if config.mod_method == 'bpsk':
             input_channel = int(config.channel_use / (4 * 4))
         else:
             input_channel = int(config.channel_use * 2 / (4 * 4))
 
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(input_channel, 256, 1, 1, 0),
-            nn.PReLU())
+        self.conv1 = tf.keras.Sequential([
+            Conv2D(256, kernel_size=1, strides=1, padding='valid'),
+            PReLU()
+        ])
+        self.layer1 = tf.keras.Sequential([
+            self._make_layer(ResidualBlock, 256, 2, stride=1),
+            PReLU()
+        ])
+        self.layer2 = tf.keras.Sequential([
+            self._make_layer(ResidualBlock, 256, 2, stride=1),
+            PReLU()
+        ])
+        self.depth_to_space1 = DepthToSpace(4)
+        self.conv2 = tf.keras.Sequential([
+            Conv2D(128, kernel_size=1, strides=1, padding='valid'),
+            PReLU()
+        ])
+        self.layer3 = tf.keras.Sequential([
+            self._make_layer(ResidualBlock, 128, 2, stride=1),
+            PReLU()
+        ])
+        self.depth_to_space2 = DepthToSpace(2)
+        self.conv3 = Conv2D(3, kernel_size=1, strides=1, padding='valid')
 
-        self.inchannel = 256
-
-        self.layer1 = nn.Sequential(
-            self.make_layer(ResidualBlock, 256, 2, stride=1),
-            nn.PReLU())
-
-        self.layer2 = nn.Sequential(
-            self.make_layer(ResidualBlock, 256, 2, stride=1),
-            nn.PReLU())
-
-        self.DepthToSpace1 = DepthToSpace(4)
-
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(16, 128, 1, 1, 0),
-            nn.PReLU())
-
-        self.inchannel = 128
-
-        self.layer3 = nn.Sequential(
-            self.make_layer(ResidualBlock, 128, 2, stride=1),
-            nn.PReLU())
-
-        self.DepthToSpace2 = DepthToSpace(2)
-
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(32, 3, 1, 1, 0))
-
-    def make_layer(self, block, channels, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)  # strides=[1,1]
+    def _make_layer(self, block, out_channels, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.inchannel, channels, stride))
-            self.inchannel = channels
-        return nn.Sequential(*layers)
+            layers.append(block(self.in_channels, out_channels, stride))
+            self.in_channels = out_channels
+        return tf.keras.Sequential(layers)
 
-    def forward(self, z):
-        z0 = self.conv1(z.reshape(z.shape[0], -1, 4, 4))
+    def call(self, z):
+        z0 = self.conv1(tf.reshape(z, [z.shape[0], -1, 4, 4]))
         z1 = self.layer1(z0)
         z2 = self.layer2(z1)
-        z3 = self.DepthToSpace1(z2)
+        z3 = self.depth_to_space1(z2)
         z4 = self.conv2(z3)
         z5 = self.layer3(z4)
-        z5 = self.DepthToSpace2(z5)
+        z5 = self.depth_to_space2(z5)
         z6 = self.conv3(z5)
         return z6
 
 
-class Decoder_Class(nn.Module):
+class Decoder_Class(tf.keras.layers.Layer):
     def __init__(self, half_width, layer_width):
         super(Decoder_Class, self).__init__()
         self.layer_width = layer_width
-        self.Half_width = half_width
-        self.fc_spinal_layer1 = nn.Sequential(
-            nn.Dropout(p=0.5), nn.Linear(self.Half_width, self.layer_width),
-            nn.PReLU(),
-        )
-        self.fc_spinal_layer2 = nn.Sequential(
-            nn.Dropout(p=0.5), nn.Linear(self.Half_width + self.layer_width, self.layer_width),
-            nn.PReLU(),
-        )
-        self.fc_spinal_layer3 = nn.Sequential(
-            nn.Dropout(p=0.5), nn.Linear(self.Half_width + self.layer_width, self.layer_width),
-            nn.PReLU(),
-        )
-        self.fc_spinal_layer4 = nn.Sequential(
-            nn.Dropout(p=0.5), nn.Linear(self.Half_width + self.layer_width, self.layer_width),
-            nn.PReLU(),
-        )
-        self.last_fc = nn.Linear(self.layer_width * 4, 10)
+        self.half_width = half_width
+        self.fc1 = tf.keras.Sequential([
+            Dropout(0.5),
+            Dense(self.layer_width, activation=PReLU())
+        ])
+        self.fc2 = tf.keras.Sequential([
+            Dropout(0.5),
+            Dense(self.layer_width, activation=PReLU())
+        ])
+        self.fc3 = tf.keras.Sequential([
+            Dropout(0.5),
+            Dense(self.layer_width, activation=PReLU())
+        ])
+        self.fc4 = tf.keras.Sequential([
+            Dropout(0.5),
+            Dense(self.layer_width, activation=PReLU())
+        ])
+        self.last_fc = Dense(10)
 
-    def forward(self, z):
-        x1 = self.fc_spinal_layer1(z[:, 0:self.Half_width])
-        x2 = self.fc_spinal_layer2(torch.cat([z[:, self.Half_width:2 * self.Half_width], x1], dim=1))
-        x3 = self.fc_spinal_layer3(torch.cat([z[:, 0:self.Half_width], x2], dim=1))
-        x4 = self.fc_spinal_layer4(torch.cat([z[:, self.Half_width:2 * self.Half_width], x3], dim=1))
-        x = torch.cat([x1, x2], dim=1)
-        x = torch.cat([x, x3], dim=1)
-        x = torch.cat([x, x4], dim=1)
-
+    def call(self, z):
+        x1 = self.fc1(z[:, :self.half_width])
+        x2 = self.fc2(tf.concat([z[:, self.half_width:2 * self.half_width], x1], axis=1))
+        x3 = self.fc3(tf.concat([z[:, :self.half_width], x2], axis=1))
+        x4 = self.fc4(tf.concat([z[:, self.half_width:2 * self.half_width], x3], axis=1))
+        x = tf.concat([x1, x2, x3, x4], axis=1)
         y_class = self.last_fc(x)
         return y_class
